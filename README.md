@@ -25,6 +25,25 @@ Production-quality Java (Spring Boot) implementations of classic system design p
 | [STUDY_GUIDE.md](./bitly/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./bitly/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Dropbox — File Storage & Sync](./dropbox/)
+
+> Design and implement a cloud file storage and sync service like Dropbox.
+
+**Core problem:** Upload files up to 50GB reliably, serve downloads with low latency globally, and sync changes across multiple devices in real time.
+
+**Key design decisions:**
+- Chunked multipart upload (8MB chunks) with presigned S3 URLs — client uploads directly to S3, bypassing app servers
+- CDN-signed URLs for downloads — files served from edge, not origin
+- Hybrid sync: WebSocket push for real-time + polling (`/files/changes?since=`) as fallback
+
+**Stack:** Spring Boot 3.2 · PostgreSQL · Redis (pub/sub) · AWS S3 · Spring WebSocket
+
+| Document | Description |
+|----------|-------------|
+| [DESIGN.md](./dropbox/DESIGN.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./dropbox/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./dropbox/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
 
 ## Document Structure

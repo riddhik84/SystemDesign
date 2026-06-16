@@ -1,0 +1,38 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:dropbox_test;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=false;MODE=PostgreSQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+
+  sql:
+    init:
+      mode: never   # DDL managed by Hibernate in test (create-drop)
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    deserialization:
+      fail-on-unknown-properties: false
+
+app:
+  s3:
+    bucket-name: test-bucket
+    region: us-east-1
+    endpoint-override: http://localhost:4566
+    presigned-url-expiry-minutes: 5
+  chunk-size-bytes: 8388608
+  base-url: http://localhost:8080
