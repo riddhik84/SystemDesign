@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: gopuff
+  datasource:
+    url: jdbc:postgresql://localhost:5432/gopuff
+    username: gopuff
+    password: gopuff
+    hikari:
+      maximum-pool-size: 20
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+  sql:
+    init:
+      mode: always
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 500ms
+
+app:
+  dc:
+    max-distance-miles: 60.0
+  cache:
+    availability-ttl-seconds: 60
+  base-url: http://localhost:8080
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, prometheus, metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
