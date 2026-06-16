@@ -1,0 +1,115 @@
+spring:
+  application:
+    name: bitly-url-shortener
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/bitly
+    username: bitly
+    password: bitly
+    hikari:
+      # Connection pool tuned for a service with high read concurrency.
+      # Each application thread that needs a DB connection checks one out from the pool;
+      # pool size should be set to approximately (# CPU cores * 2) + effective_spindle_count
+      # per the PgBouncer / HikariCP guidelines.
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 3000        # 3s — fail fast rather than queue
+      idle-timeout: 600000            # 10m
+      max-lifetime: 1800000           # 30m — recycle before PostgreSQL server-side timeout
+      pool-name: BitlyHikariPool
+      auto-commit: false
+
+  jpa:
+    hibernate:
+      # 'validate': Hibernate checks schema against entity definitions at startup.
+      # We do NOT use 'create' or 'update' in production; schema.sql is the source of truth.
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        # Batch writes: group INSERT statements into fewer round-trips (helps at write peaks)
+        jdbc:
+          batch_size: 50
+          order_inserts: true
+          order_updates: true
+    open-in-view: false   # Disable OSIV; we use explicit @Transactional boundaries
+
+  sql:
+    init:
+      mode: always          # Run schema.sql on startup (idempotent CREATE IF NOT EXISTS)
+      schema-locations: classpath:schema.sql
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      # password: ${REDIS_PASSWORD:}   # Uncomment when Redis AUTH is enabled
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 2
+          max-wait: 1000ms
+        shutdown-timeout: 200ms
+      connect-timeout: 2000ms
+      timeout: 500ms     # Command timeout — keeps redirect latency bounded even if Redis degrades
+
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false   # ISO-8601 strings for dates
+    deserialization:
+      fail-on-unknown-properties: false  # Forward-compatible API
+
+# Application-specific properties (bound to AppProperties)
+app:
+  base-url: ${APP_BASE_URL:http://localhost:8080}
+  cache:
+    default-ttl-seconds: ${CACHE_DEFAULT_TTL_SECONDS:86400}   # 24 hours
+
+server:
+  port: ${SERVER_PORT:8080}
+  compression:
+    enabled: true
+    mime-types: application/json
+    min-response-size: 512
+  tomcat:
+    # Increase max threads to handle redirect burst traffic (1000:1 read:write)
+    threads:
+      max: 200
+      min-spare: 20
+    connection-timeout: 5000ms
+    accept-count: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  health:
+    redis:
+      enabled: true
+    db:
+      enabled: true
+
+# OpenAPI / Swagger
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    com.systemdesign.bitly: INFO
+    org.springframework.data.redis: WARN
+    org.hibernate.SQL: WARN

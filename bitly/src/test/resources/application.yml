@@ -1,0 +1,34 @@
+# Test configuration — overrides main application.yml for test slices.
+# @WebMvcTest and unit tests do NOT need a real database or Redis connection.
+# This file prevents Spring from failing on missing infrastructure during test runs.
+
+spring:
+  datasource:
+    url: jdbc:h2:mem:bitlytest;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: create-drop   # H2: create schema from entity definitions; drop on exit
+    database-platform: org.hibernate.dialect.H2Dialect
+    show-sql: false
+  sql:
+    init:
+      mode: never             # Do NOT run schema.sql (PostgreSQL DDL) against H2
+
+  data:
+    redis:
+      host: localhost
+      port: 6370              # Non-standard port — test slices mock Redis beans so no
+                               # real connection is attempted; this just prevents port conflict
+
+app:
+  base-url: http://localhost:8080
+  cache:
+    default-ttl-seconds: 86400
+
+logging:
+  level:
+    com.systemdesign.bitly: DEBUG
+    org.springframework.test: WARN
