@@ -1,0 +1,23 @@
+# Test profile. Unit tests use Mockito and @WebMvcTest, so no real Postgres/Redis is
+# needed. We disable DB/Redis/SQL-init auto-configuration to keep the test context light
+# and offline.
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+  sql:
+    init:
+      mode: never
+
+app:
+  dc:
+    max-distance-miles: 60.0
+  cache:
+    availability-ttl-seconds: 60
+  base-url: http://localhost:8080
+
+logging:
+  level:
+    root: WARN
+    com.systemdesign.gopuff: INFO

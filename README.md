@@ -44,6 +44,25 @@ Production-quality Java (Spring Boot) implementations of classic system design p
 | [STUDY_GUIDE.md](./dropbox/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./dropbox/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [GoPuff — Local Delivery Service](./gopuff/)
+
+> Design a local on-demand delivery service where users can order items for delivery within 1 hour from nearby distribution centers.
+
+**Core problem:** Prevent two customers from purchasing the same physical item (strong consistency on orders) while serving availability queries at 20K RPS under 100ms.
+
+**Key design decisions:**
+- `SERIALIZABLE` isolation + `SELECT FOR UPDATE` on inventory rows — eliminates double-booking without distributed transactions
+- Redis availability cache with coordinate-rounded keys (2 decimal places ≈ 1km) and 60s TTL
+- Haversine-based DC discovery (≤60 miles), single-DC fulfillment — reject whole order if any item OOS
+
+**Stack:** Spring Boot 3.2 · PostgreSQL (SERIALIZABLE) · Redis · Spring Data JPA
+
+| Document | Description |
+|----------|-------------|
+| [DESIGN.md](./gopuff/DESIGN.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./gopuff/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./gopuff/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
 
 ## Document Structure
