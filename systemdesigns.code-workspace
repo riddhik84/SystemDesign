@@ -7,5 +7,7 @@
 			"path": "bitly"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"java.compile.nullAnalysis.mode": "disabled"
+	}
 }
