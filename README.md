@@ -63,6 +63,26 @@ Production-quality Java (Spring Boot) implementations of classic system design p
 | [STUDY_GUIDE.md](./gopuff/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./gopuff/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Google News — Feed Aggregator](./googlenews/)
+
+> Design a news aggregation platform that crawls thousands of sources and delivers personalized feeds to millions of users.
+
+**Core problem:** Aggregate 100K articles/day from 10K+ RSS/Atom feeds, deduplicate content, rank by relevance + freshness, and serve personalized feeds to 500M users with p95 latency < 500ms.
+
+**Key design decisions:**
+- Polling-based crawler (every 5-15 min) with adaptive scheduling and exponential backoff on failures
+- SHA-256 content hash for exact duplicate detection within 7-day sliding window
+- Two-stage ranking: candidate retrieval (500 articles matching interests) → personalized scoring (freshness · trust · relevance · engagement)
+- Redis caching with 5-min TTL on feeds, 30-min on article content
+
+**Stack:** Spring Boot 3.2 · PostgreSQL · Redis · Elasticsearch · Rome RSS Parser · Spring Scheduling
+
+| Document | Description |
+|----------|-------------|
+| [DESIGN.md](./googlenews/DESIGN.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./googlenews/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./googlenews/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
 
 ## Document Structure
