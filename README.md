@@ -83,6 +83,27 @@ Production-quality Java (Spring Boot) implementations of classic system design p
 | [STUDY_GUIDE.md](./googlenews/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./googlenews/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Ticketmaster — Event Ticketing](./ticketmaster/)
+
+> Design an event ticketing platform that handles seat reservations with zero double-booking under high concurrency.
+
+**Core problem:** Prevent double-booking when 500K users simultaneously try to reserve seats for high-demand events (Taylor Swift, World Cup), ensuring 100% booking correctness while maintaining sub-2s latency.
+
+**Key design decisions:**
+- `SERIALIZABLE` isolation + pessimistic locking (`SELECT FOR UPDATE`) — guarantees exactly one winner per seat
+- Distributed Redis locks across API servers for event-level coordination
+- 10-minute seat holds with scheduled expiry job (every 30 seconds)
+- Idempotent payment processing using booking ID as idempotency key
+- Waiting room/queue (Redis sorted set) to handle traffic spikes — admit 100 users per 10 seconds
+
+**Stack:** Spring Boot 3.2 · PostgreSQL (SERIALIZABLE) · Redis · Spring Scheduling
+
+| Document | Description |
+|----------|-------------|
+| [DESIGN.md](./googlenews/DESIGN.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./googlenews/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./googlenews/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
 
 ## Document Structure
