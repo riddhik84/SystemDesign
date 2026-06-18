@@ -187,4 +187,24 @@ See the individual project's `DESIGN.md` for project-specific details.
 | [STUDY_GUIDE.md](./facebook-newsfeed/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./facebook-newsfeed/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Tinder — Dating App](./tinder/)
+
+> Design a dating application with profile matching, geospatial discovery, and swipe-based interactions.
+
+**Core problem:** Process 2B swipes/day (20M DAU × 100 swipes/user) with strong consistency on match detection (no lost matches) and sub-300ms feed generation.
+
+**Key design decisions:**
+- Redis + Lua scripting for atomic match detection — solves race condition when two users swipe right simultaneously
+- Geospatial filtering with Haversine distance formula in PostgreSQL (production: Elasticsearch with geo-index)
+- Feed pre-computation with 15-min Redis cache — trade freshness for latency
+- Normalized match pairs (user1_id < user2_id) — single row per match regardless of swipe order
+
+**Stack:** Spring Boot 3.2 · PostgreSQL · Redis · Spring Data JPA
+
+| Document | Description |
+|----------|-------------|
+| [DESIGN.md](./tinder/DESIGN.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./tinder/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./tinder/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
