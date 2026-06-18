@@ -166,3 +166,25 @@ See the individual project's `DESIGN.md` for project-specific details.
 - **Uber** — geospatial indexing, ride matching, real-time location updates
 - **Netflix** — CDN design, video chunking, adaptive bitrate
 - **WhatsApp** — message queues, delivery receipts, WebSocket at scale
+
+### [Facebook News Feed](./facebook-newsfeed/)
+
+> Design a social media news feed that aggregates posts from followed users and ranks them by relevance.
+
+**Core problem:** Serve 10B feed requests/day (115K QPS) with sub-500ms latency while handling fanout for users with millions of followers.
+
+**Key design decisions:**
+- Hybrid fanout: fanout-on-write for normal users (< 1M followers), fanout-on-read for celebrities
+- Redis sorted sets store pre-computed feeds (post IDs + ranking scores)
+- Async fanout via Kafka with batched Redis writes (100 per pipeline)
+- Multi-factor ranking: recency (50%) + engagement (30%) + relationship strength (15%) + preference (5%)
+
+**Stack:** Spring Boot 3.2 · PostgreSQL · Redis · Kafka (simulated)
+
+| Document | Description |
+|----------|-------------|
+| [DESIGN.md](./facebook-newsfeed/DESIGN.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./facebook-newsfeed/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./facebook-newsfeed/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
+---

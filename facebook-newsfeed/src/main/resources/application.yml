@@ -1,0 +1,21 @@
+spring:
+  application:
+    name: facebook-newsfeed
+  datasource:
+    url: jdbc:postgresql://localhost:5432/newsfeed
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: update
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+server:
+  port: 8080
+
+app:
+  celebrity-threshold: 1000000
+  feed-size: 1000
