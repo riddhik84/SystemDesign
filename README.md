@@ -227,4 +227,25 @@ See the individual project's `DESIGN.md` for project-specific details.
 | [STUDY_GUIDE.md](./leetcode/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./leetcode/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [WhatsApp — Messaging Platform](./whatsapp/)
+
+> Design a real-time messaging platform with group chats, offline message delivery, and media attachments.
+
+**Core problem:** Handle 200M concurrent WebSocket connections and 40K messages/second with <500ms delivery latency, guaranteeing message delivery even for offline users.
+
+**Key design decisions:**
+- WebSocket for bidirectional real-time communication (<50ms latency vs. HTTP polling)
+- Redis Pub/Sub for lightweight message routing between Chat Servers (per-user channels)
+- Inbox pattern for guaranteed delivery — write to DB before ACK, sync on reconnect
+- Sequence numbers + heartbeat (30s) for gap detection and missed message recovery
+- Per-client Inbox (not per-user) enables multi-device sync for up to 3 devices
+
+**Stack:** Spring Boot 3.2 · H2/JPA · Redis Pub/Sub · Spring WebSocket
+
+| Document | Description |
+|----------|-------------|
+| [README.md](./whatsapp/README.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./whatsapp/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./whatsapp/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
