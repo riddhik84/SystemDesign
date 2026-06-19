@@ -207,4 +207,24 @@ See the individual project's `DESIGN.md` for project-specific details.
 | [STUDY_GUIDE.md](./tinder/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./tinder/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [LeetCode — Online Coding Platform](./leetcode/)
+
+> Design a coding platform with problem browsing, sandboxed code execution, competitions, and real-time leaderboards.
+
+**Core problem:** Execute 10K concurrent code submissions safely (isolated, untrusted code) within 5 seconds while maintaining a live leaderboard for 100K users during competitions.
+
+**Key design decisions:**
+- Docker containers for code execution with strict security (read-only FS, no network, 256MB RAM, 50% CPU, 5s timeout)
+- Async processing with thread pool (core: 10, max: 50, queue: 500) — non-blocking API responses
+- Redis Sorted Set (ZSET) for O(log N) leaderboard updates — score = problemsSolved × 1M - timeMs/1000
+- Auto-scaling worker pool based on queue depth — ~1,667 CPU cores needed for 10K concurrent submissions
+
+**Stack:** Spring Boot 3.2 · H2/JPA · Redis · Docker Java API · Spring @Async
+
+| Document | Description |
+|----------|-------------|
+| [README.md](./leetcode/README.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./leetcode/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./leetcode/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---

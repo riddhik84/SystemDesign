@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: leetcode-platform
+
+  datasource:
+    url: jdbc:h2:mem:leetcode
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.H2Dialect
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 60000
+
+  cache:
+    type: redis
+    redis:
+      time-to-live: 600000
+
+server:
+  port: 8080
+
+logging:
+  level:
+    com.systemdesign.leetcode: DEBUG
+    org.springframework.web: DEBUG
