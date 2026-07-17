@@ -1,0 +1,31 @@
+spring:
+  profiles:
+    active: test
+  datasource:
+    url: jdbc:h2:mem:yelp_test
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+  data:
+    redis:
+      host: localhost
+      port: 6370  # Non-existent port — Redis calls should fail gracefully
+
+app:
+  geo:
+    default-radius-km: 5.0
+    max-radius-km: 40.0
+  cache:
+    search-ttl-seconds: 300
+    business-ttl-seconds: 600
+    stars-ttl-seconds: 3600
+  search:
+    default-page-size: 20
+    max-page-size: 100
