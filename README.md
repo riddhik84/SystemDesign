@@ -187,6 +187,27 @@ See the individual project's `DESIGN.md` for project-specific details.
 | [STUDY_GUIDE.md](./facebook-newsfeed/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./facebook-newsfeed/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Instagram — Photo Sharing Platform](./instagram/)
+
+> Design a photo/video sharing platform with a follow graph and a reverse-chronological feed of followed users.
+
+**Core problem:** Serve feeds to 500M DAU with p99 < 500ms while ingesting 100M posts/day — balancing fanout write amplification against feed read latency, including users who follow celebrities with tens of millions of followers.
+
+**Key design decisions:**
+- Hybrid fanout: fanout-on-write (Redis ZSET `insta:feed:{userId}`) for normal users; fanout-on-read (DB pull of recent posts) for celebrities (≥ 100K followers) — with cold-start DB fallback when the cached feed is empty
+- Fanout runs after the post transaction commits via `@TransactionalEventListener(AFTER_COMMIT)` + `@Async` — eliminates read-before-commit races
+- Atomic conditional SQL flips the celebrity flag at the follower threshold (no read-check-update race)
+- Presigned upload URLs + CDN delivery — clients upload media directly, bypassing app servers; posts reference only `UPLOADED` media
+- Redis feed cache capped at 1000 posts/user with graceful degradation (Redis failure → DB fallback)
+
+**Stack:** Spring Boot 3.2 · H2/JPA · Redis · Spring @Async
+
+| Document | Description |
+|----------|-------------|
+| [README.md](./instagram/README.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./instagram/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./instagram/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ### [Tinder — Dating App](./tinder/)
 
 > Design a dating application with profile matching, geospatial discovery, and swipe-based interactions.

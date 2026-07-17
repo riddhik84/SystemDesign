@@ -1,0 +1,34 @@
+spring:
+  profiles:
+    active: test
+  datasource:
+    url: jdbc:h2:mem:instagram_test
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+  data:
+    redis:
+      host: localhost
+      port: 6370  # Non-existent port — Redis calls should fail gracefully
+
+app:
+  feed:
+    page-size: 20
+    max-cached-feed: 1000
+    celebrity-follower-threshold: 3
+    celebrity-lookback-hours: 24
+  cache:
+    feed-ttl-seconds: 86400
+    post-ttl-seconds: 3600
+  media:
+    max-photo-bytes: 8388608
+    max-video-bytes: 4294967296
+    cdn-base-url: https://cdn.instagram-clone.example.com
+    upload-base-url: https://uploads.instagram-clone.example.com
