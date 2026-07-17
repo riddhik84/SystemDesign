@@ -56,14 +56,12 @@ Eleven designs are implemented, listed alphabetically. Every project ships three
 **Core problem:** Serve 10B feed reads/day (~115K QPS) to 500M DAU while fanning out 100M posts/day to ~300 followers each within a p95 of 500ms — and avoid a fanout explosion when celebrity accounts (>1M followers) post.
 
 **Key design decisions:**
-- Hybrid fanout — fanout-on-write for normal users (pre-computed feeds), fanout-on-read for celebrities (>1M followers) to avoid the write explosion
-- Per-user Redis sorted sets holding only post IDs, capped at ~1,000/user; full posts batch-fetched from PostgreSQL on read
-- Async fanout via a message queue (Kafka in the design) with Redis pipelining (~100 feed writes per round-trip)
-- Ranking blends recency decay, engagement, relationship strength, and content-type preference
+- Hybrid fanout — fanout-on-write pushes `postId` into each follower's Redis ZSET for normal users; celebrities skip the write and have their recent posts pulled on read, with automatic promotion past a follower threshold to avoid the write explosion
+- Fanout runs after commit via a `PostCreatedEvent` handled by `@TransactionalEventListener(AFTER_COMMIT)` + `@Async` — post creation never blocks on propagation
+- Feed ZSET (`feed:{userId}`, score = `createdAt` ms) capped at 1,000 posts with a 1-day TTL, plus a 1h post cache; cold-start DB fallback and try/catch-wrapped Redis for graceful degradation
+- Read-time relevance ranking — the News Feed differentiator: `score = recencyDecay · engagementBoost · affinity`, applied when the feed is read rather than at write time
 
-**Stack:** Spring Boot 3.2 · PostgreSQL · Redis · Spring @Async
-
-> **Note:** This entry is currently a design doc + application scaffold — the feed/fanout/ranking services described are specified but not yet implemented in code.
+**Stack:** Spring Boot 3.2 · H2 (in-memory) · Redis · Spring @Async
 
 | Document | Description |
 |----------|-------------|
@@ -277,7 +275,7 @@ Every project ships with three documents:
 
 Each project is a standalone Maven module — run it with `cd <project> && mvn spring-boot:run`.
 
-**In-memory projects** (Instagram, LeetCode, WhatsApp, Yelp) run on H2 with no external database. They only need Redis if you want the caching / pub-sub paths exercised:
+**In-memory projects** (Facebook, Instagram, LeetCode, WhatsApp, Yelp) run on H2 with no external database. They only need Redis if you want the caching / pub-sub paths exercised:
 
 ```bash
 docker run -d --name redis -p 6379:6379 redis:7
@@ -285,7 +283,7 @@ cd <project>
 mvn spring-boot:run
 ```
 
-**PostgreSQL-backed projects** (Bitly, Dropbox, Facebook, Google News, GoPuff, Ticketmaster, Tinder) need PostgreSQL and Redis:
+**PostgreSQL-backed projects** (Bitly, Dropbox, Google News, GoPuff, Ticketmaster, Tinder) need PostgreSQL and Redis:
 
 ```bash
 # PostgreSQL
