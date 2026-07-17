@@ -248,4 +248,25 @@ See the individual project's `DESIGN.md` for project-specific details.
 | [STUDY_GUIDE.md](./whatsapp/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./whatsapp/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Yelp — Local Business Search](./yelp/)
+
+> Design a local business search and review platform like Yelp.
+
+**Core problem:** Find businesses within a configurable radius across 500M locations at 11,600 QPS with < 100ms p99 latency, while maintaining accurate aggregate star ratings without expensive on-the-fly computation.
+
+**Key design decisions:**
+- Two-phase geospatial search: bounding-box SQL scan (B-tree on lat/lon) → Haversine post-filter — eliminates O(N) full scans
+- Geohash precision selection (4/5/6 chars) + 8 neighbor cells — prevents boundary artifacts, adapts cell size to search radius
+- Denormalized `starRating` + `reviewCount` on Business — recalculated from DB after each review write; eliminates GROUP BY at query time
+- Redis cache with 3-decimal-place coordinate rounding (≈111m precision) — users within 111m share cache entries for high urban hit rate
+- Business detail cache evicted on review write; search cache relies on 5-min TTL (stale search results acceptable)
+
+**Stack:** Spring Boot 3.2 · H2/JPA · Redis · Spring Data JPA
+
+| Document | Description |
+|----------|-------------|
+| [README.md](./yelp/README.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./yelp/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./yelp/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ---
