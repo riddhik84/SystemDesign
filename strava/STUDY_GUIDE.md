@@ -8,7 +8,7 @@
 - A 1-hour activity at **1 sample/sec ≈ 3,600 points**. Raw point ≈ 40 bytes → **~144 KB/activity** raw, far less as an encoded polyline.
 - **If clients streamed every GPS tick:** 10M concurrent × 1 write/sec = **10M writes/sec** — brutal.
 - **Batched instead:** sync a small batch every ~10s → 10M / 10 = **~1M append-writes/sec**, each a tiny append + a few arithmetic ops, sharded by activity. An order of magnitude cheaper and horizontally shardable.
-- **Storage/day:** if ~1–2M activities complete per day × ~50–150 KB → tens to low-hundreds of GB/day of route data (cold-storable / compressible).
+- **Storage:** route points dominate — store the **encoded polyline (~5 KB/activity)**, not the ~144 KB raw. ~100M activities/year × ~5 KB ≈ **~0.5 TB/year** of route data (append-only, compressible, cold-storable).
 - **Live location TTL:** ~300s (code default) — hot entries auto-expire, so the "who's out right now" query never scans the DB.
 - **Read side** (feeds, activity detail, leaderboards) is cache-friendly and dwarfed by the write path in engineering difficulty.
 
