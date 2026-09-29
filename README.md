@@ -6,7 +6,7 @@ Runnable Java (Spring Boot) implementations of classic system design problems �
 
 ## Projects
 
-Eleven designs are implemented, listed alphabetically. Every project ships three companion documents (design doc, study guide, code walkthrough) and follows the same section format below.
+Twelve designs are implemented, listed alphabetically. Every project ships three companion documents (design doc, study guide, code walkthrough) and follows the same section format below.
 
 ### [Bitly — URL Shortener](./bitly/)
 
@@ -153,6 +153,27 @@ Eleven designs are implemented, listed alphabetically. Every project ships three
 | [STUDY_GUIDE.md](./leetcode/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
 | [CODE_WALKTHROUGH.md](./leetcode/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
 
+### [Strava — Activity Tracking Platform](./strava/)
+
+> Design an activity-tracking platform where users record runs and rides — capturing GPS route, distance, and time — that works offline and syncs reliably at scale.
+
+**Core problem:** Record accurate, up-to-date activity stats that keep working offline in remote areas — for 100M+ users and a target of 10M concurrent activities — while serving cache-friendly feeds, activity detail, and segment leaderboards, favoring availability over consistency.
+
+**Key design decisions:**
+- Client as source of truth while recording — the phone samples GPS, computes distance/time/elevation locally, and buffers points offline, so live stats stay accurate with no network; this one decision yields offline support and a cheap, shardable write path
+- Idempotent batched sync — buffered points ship in ordered batches with a client-assigned monotonic sequence; the server appends points and reconciles running aggregates, so retries are safe and clients sync at their own cadence rather than per-GPS-tick
+- Scale to 10M concurrent activities by sharding the append path by user/activity — ~1M lightweight batch writes/sec (small batch every ~10s) instead of streaming every GPS tick
+- Real-time friend sharing (Beacon) via a short-TTL Redis live-location cache read by the friend feed (production would push over WebSocket)
+- Segment leaderboards as Redis sorted sets (best-time per user), populated by async segment-matching after an activity completes, with a DB fallback
+
+**Stack:** Spring Boot 3.2 · H2 (in-memory) · Redis · Spring @Async
+
+| Document | Description |
+|----------|-------------|
+| [README.md](./strava/README.md) | Full system design — capacity estimates, architecture, deep dives, trade-offs |
+| [STUDY_GUIDE.md](./strava/STUDY_GUIDE.md) | Interview prep — clarifying questions, key numbers, decision comparisons, common follow-ups |
+| [CODE_WALKTHROUGH.md](./strava/CODE_WALKTHROUGH.md) | Code tour — reading order, flow traces, why each design choice was made in code |
+
 ### [Ticketmaster — Event Ticketing](./ticketmaster/)
 
 > Design an event ticketing platform that handles seat reservations with zero double-booking under high concurrency.
@@ -275,7 +296,7 @@ Every project ships with three documents:
 
 Each project is a standalone Maven module — run it with `cd <project> && mvn spring-boot:run`.
 
-**In-memory projects** (Facebook, Instagram, LeetCode, WhatsApp, Yelp) run on H2 with no external database. They only need Redis if you want the caching / pub-sub paths exercised:
+**In-memory projects** (Facebook, Instagram, LeetCode, Strava, WhatsApp, Yelp) run on H2 with no external database. They only need Redis if you want the caching / pub-sub paths exercised:
 
 ```bash
 docker run -d --name redis -p 6379:6379 redis:7
