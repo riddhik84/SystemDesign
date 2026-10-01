@@ -302,3 +302,56 @@ With 10% headroom = 220 servers
 - High-Level Architecture: 10 min
 - Deep Dives (2-3 topics): 20 min
 - Trade-offs & Closing: 5 min
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Real-time push (WebSocket) tier** — the Chat Servers hold 200M persistent WebSocket connections and push `NEW_MESSAGE` events to clients; this is the primary compute tier.
+- **Relational DB** — PostgreSQL is the durable source of truth for Chat, Message, Inbox, ChatParticipant, Client, and LastSeen; the Inbox ACK protocol depends on transactional writes.
+- **Key-value / cache** — Redis holds connection state and online-user / last-seen tracking so a Chat Server can locate a recipient without hitting the DB.
+- **Pub/sub (message routing)** — Redis Pub/Sub fans messages out between Chat Servers on `user:{id}` / `chat:{id}` channels so servers stay decoupled.
+- **Object / blob storage** — S3 stores media attachments (images, video, audio, documents) referenced by pre-signed URL, keeping blobs out of the message row.
+- **CDN / edge** — media attachments are served to a global user base; a CDN caches them near the client instead of hitting the object store on every download.
+- **Coordination / service discovery** — consistent hashing backed by ZooKeeper/Etcd assigns each `userId` to exactly one Chat Server and reassigns it when a node is lost, so routing stays deterministic as the fleet changes.
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+| --- | --- | --- | --- | --- |
+| Real-time push (WebSocket) tier | In-JVM Spring WebSocket + in-memory connection map | EC2/EKS behind an NLB (or API Gateway WebSocket API for smaller scale) | GCE/GKE behind an external passthrough NLB | Long-lived bidirectional connections that need server push |
+| Relational DB | H2 in-memory (JPA/Hibernate) | RDS or Aurora PostgreSQL | Cloud SQL for PostgreSQL / AlloyDB | Durable, transactional, ACID storage for chats/messages/inbox |
+| Key-value / cache | Local single-node Redis | ElastiCache for Redis (MemoryDB if durable) | Memorystore for Redis | Sub-ms lookups of connection/online state |
+| Pub/sub (routing) | Local Redis Pub/Sub | ElastiCache for Redis Pub/Sub (MSK/SNS+SQS if durable stream needed) | Memorystore for Redis Pub/Sub (Cloud Pub/Sub if durable stream needed) | Low-latency fan-out between stateful servers |
+| Object / blob storage | Local disk / mock S3 | S3 (+ lifecycle to Glacier) | Cloud Storage (+ lifecycle to Coldline/Archive) | Store media blobs cheaply with a 30-day TTL |
+| CDN / edge | None (served directly) | CloudFront | Cloud CDN / Media CDN | Cache media near clients, offload the object store |
+| Coordination / service discovery | None (single node, no hashing ring) | Self-managed ZooKeeper/etcd on EC2 (no first-party managed ZooKeeper/etcd); AWS Cloud Map for pure service discovery | Self-managed ZooKeeper/etcd on GCE (no first-party managed ZooKeeper/etcd); GCP Service Directory for pure service discovery | Routing a userId consistently to one Chat Server and reassigning on node loss |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers for this design:
+- **200M concurrent WebSocket connections** (1B users × 20% online).
+- **40K message writes/sec** inbound; **~400K Inbox writes/sec** with ~10-recipient fan-out.
+- **~8.6 TB/day** storage growth (1.7 TB messages + 6.9 TB inbox), 30-day TTL.
+- **20 MB/s inbound / 200 MB/s outbound** bandwidth.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+| --- | --- | --- | --- | --- |
+| Chat / WebSocket app tier | 200M connections | ~200M / ~1M conns per node ≈ 200 nodes + ~10% headroom ≈ 220 nodes (memory + network bound) | ~220 × c7gn.4xlarge (network-optimized Graviton) / r7g.4xlarge | ~220 × n2-highmem-16 / c3-highmem-22 |
+| Primary DB (sharded) | ~440K writes/sec | ~440K / ~15K write TPS per shard ≈ 30 sharded primaries, sharded by userId/chatId | ~30 × Aurora PostgreSQL db.r6g.4xlarge | ~30 × AlloyDB / Cloud SQL Enterprise Plus (16 vCPU) |
+| Read replicas | History-read queries (`GET /messages`) | 2 replicas per shard for read scaling + HA | Aurora replica db.r6g.2xlarge | AlloyDB read pool / Cloud SQL read replica |
+| Cache (connection state) | 200M online users | 200M × ~100 B ≈ 20 GB → 3-shard cluster with replicas | ElastiCache cache.r7g.xlarge × 3 | Memorystore for Redis Standard (~40 GB tier) |
+| Pub/Sub (routing) | ~400K deliveries/sec | Fan-out sharded by userId hash across ~6-8 nodes | ElastiCache cache.r7g.large × 6-8 | Memorystore for Redis × 6-8 |
+| Object store (media) | 30-day media retention | Usage-billed; lifecycle-expire blobs at 30 days | S3 (no instances) | Cloud Storage (no instances) |
+| CDN (media delivery) | 200 MB/s+ outbound media | Edge-cached, egress-billed; no instance sizing | CloudFront | Cloud CDN / Media CDN |
+
+### Load balancing & edge
+- **Chat tier → L4 network LB.** 200M long-lived TCP/WebSocket connections favor an L4 passthrough LB over L7: **AWS Network Load Balancer (NLB)** / **GCP external passthrough Network Load Balancer**. Lower per-connection overhead and connection-oriented routing.
+- **REST tier → L7 application LB.** History/status endpoints use path routing and TLS termination: **AWS ALB** / **GCP external Application Load Balancer**.
+- **Global entry.** Route users to the nearest region via anycast: **AWS Global Accelerator** / GCP's global external LB (single anycast IP, built in).
+- **Media → CDN.** Pre-signed S3/GCS URLs fronted by **CloudFront** / **Cloud CDN** so attachments serve from the edge, not origin.
+- **Sticky / long-lived connections.** WebSocket connections are inherently pinned — the NLB keeps a flow on one target for its lifetime, so no cookie stickiness is needed. Set idle timeouts above the 30s heartbeat interval, and on target loss the client reconnects and consistent hashing (ZooKeeper/Etcd) reassigns it.
+
+### VMs vs containers vs serverless — the call
+Use **containers on Kubernetes** for the Chat tier — **AWS EKS** / **GCP GKE**. The load is steady and connection-heavy rather than spiky, and 200M long-lived WebSocket connections rule out serverless (Lambda/Cloud Functions cap execution time and don't hold persistent sockets; API Gateway WebSocket is viable only at far smaller scale). Kubernetes gives graceful rolling deploys with connection draining, which matters when each pod holds ~1M sockets. Raw VMs via **EC2 Auto Scaling Groups** / **GCE Managed Instance Groups** are an equally valid alternative if you need node-level kernel/network tuning for connection density; stateless REST endpoints can additionally run on **Cloud Run / Fargate** to absorb read spikes cheaply.

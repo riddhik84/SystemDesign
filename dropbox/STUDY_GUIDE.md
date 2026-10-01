@@ -272,3 +272,53 @@ DESIGN CHOICES:
   • Eventual consistency (AP system — availability > consistency)
   • CDN (CloudFront) for download (edge caching, reduce S3 egress)
 ```
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Object / blob storage** — the actual file bytes (up to 50 GB) live here; `S3StorageService` uses the S3 multipart API and never routes bytes through the app tier.
+- **Relational DB** — `file_metadata`, `file_chunks`, `shared_files` need ACID for the `completeUpload` transaction and a B-tree index on `updated_at` for sync polling.
+- **Pub/sub (stream-log)** — Redis pub/sub channel `file-changes:{uid}` fans a change event from any app instance out to every device's WebSocket, so app servers stay stateless.
+- **Real-time push (WebSocket) tier** — `SyncWebSocketHandler` holds a persistent connection per device to push CREATED/SHARED events without polling.
+- **CDN / edge** — `FileDownloadService` returns a signed URL fronted by CloudFront so popular files serve from the nearest PoP and skip the S3 origin (< 100 ms cached target).
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|---|---|---|---|---|
+| Object / blob storage | LocalStack S3 at `:4566` via AWS SDK | S3 (Standard + Glacier lifecycle + Cross-Region Replication) | Cloud Storage (Standard + Nearline/Coldline + dual-region) | Immutable large blobs, HTTP PUT/GET, multipart, 11-nine durability |
+| Relational DB | H2 in-memory (PostgreSQL mode) in tests; local PostgreSQL for dev | RDS for PostgreSQL or Aurora PostgreSQL (Multi-AZ) | Cloud SQL for PostgreSQL, or AlloyDB for heavy read fan-out | ACID metadata, JOINs, indexed `updated_at` sync queries |
+| Pub/sub (fan-out) | Local Redis at `:6379` | ElastiCache for Redis (cluster mode + replica) | Memorystore for Redis (Standard HA tier) | Cross-instance push fan-out with sub-second latency, tiny payloads |
+| Real-time push (WebSocket) tier | In-JVM Spring `TextWebSocketHandler` (in-memory session map) | API Gateway WebSocket (managed) or a self-managed EC2/EKS fleet | No managed API-Gateway-WebSocket equivalent — GKE WebSocket fleet, or Cloud Run (native WebSocket support) | Millions of long-lived connections needing server-initiated push |
+| CDN / edge | None — signed LocalStack S3 URL returned directly | CloudFront | Cloud CDN (Media CDN for large media) | Cache popular downloads at edge, cut S3/GCS egress and first-byte latency |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers for this design:
+- **Upload QPS**: ~5,800/s steady, peak ~15k/s (500M uploads/day ÷ 86,400).
+- **Download-URL QPS**: ~11,600/s (app only signs URLs; bytes are served by the CDN).
+- **Concurrent WebSocket connections**: ~500M (100M DAU × ~5 devices).
+- **Storage**: 10 PB in S3 (~1 TB of PostgreSQL metadata, ~1 GB Redis working set).
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|---|---|---|---|---|
+| App / API tier | ~30K QPS steady (5.8K initiate + 5.8K complete + 11.6K download-URL + ~7K sync/share), ~50K peak | Lightweight metadata + URL-signing, no bytes: ~30K QPS / ~5K QPS per node ~= 6 nodes + ~50% headroom ~= 9; size to ~15 for the ~50K peak | ~15 × c7g.2xlarge (8 vCPU) behind ALB, HPA | ~15 × c3-standard-8 on GKE, HPA |
+| Primary DB | 5.8K metadata writes/s + ~40K batched chunk-row inserts/s | Write-heavy primary; batch inserts (batch_size=50) + partition `file_chunks` by file_id | db.r6g.4xlarge (Aurora/RDS PostgreSQL, 16 vCPU / 128 GB), Multi-AZ | Cloud SQL PostgreSQL 16 vCPU / 128 GB, or AlloyDB primary |
+| Read replicas | ~11.6K read/s (download access checks + `updated_at>since` sync) | Offload reads from primary; 2-3 replicas cover read load + failover | 2-3 × db.r6g.2xlarge read replicas | AlloyDB read pool (2-3 nodes) or Cloud SQL read replicas |
+| Cache / pub-sub | 5.8K publishes/s → ~29K push fan-out/s; ~1 GB working set | Memory tiny, throughput moderate; HA replica so pub/sub survives failover | ElastiCache Redis cache.r7g.large (+ replica) | Memorystore Redis Standard, ~5 GB HA |
+| Object store | 10 PB, +20%/yr | Fully managed, no instances; lifecycle to cold tier + CRR for DR | S3 Standard + Glacier + CRR | Cloud Storage Standard + Coldline + dual-region |
+| CDN | 11.6K download URLs/s → mostly edge hits | Managed edge PoPs, no instance sizing; signed URLs, invalidate on delete | CloudFront | Cloud CDN |
+| WebSocket tier | ~500M concurrent connections, ~29K pushes/s | Memory/FD-bound. The earlier ~1,000 conns/node figure assumes WebSockets co-located on general-purpose app servers; a dedicated, tuned fleet (epoll, raised FD limits, thin per-connection state) packs ~100K conns/node → ~500M / ~100K ~= ~5,000 nodes if self-managed — prefer a managed WebSocket layer to avoid running the fleet | API Gateway WebSocket (managed), else ~5,000 × r7g.xlarge fleet | GKE fleet on n2-highmem (no managed API-GW-WS), or Cloud Run WebSockets |
+
+### Load balancing & edge
+- **L7 application LB for the REST API** — path-routes `/files/*` and terminates TLS. AWS **Application Load Balancer**; GCP **Global External Application Load Balancer**.
+- **WebSocket handling** — the same L7 LB carries the WS upgrade, but raise the idle timeout well above the 60 s default and enable connection draining for deploys. Because Redis pub/sub fans events to whichever node holds the socket, **no session affinity is needed for correctness** — the connection is naturally sticky, message routing is not.
+- **CDN fronts the object store, not the LB** — download signed URLs point at CloudFront / Cloud CDN over S3/GCS; only metadata and URL-signing calls hit the ALB.
+- **Global reach** — for a worldwide user base, add AWS **Global Accelerator** / a GCP global anycast IP so API traffic enters the nearest region while CDN handles the bytes.
+
+### VMs vs containers vs serverless — the call
+Use **containers with autoscaling** for both the stateless API tier and the WebSocket fan-out fleet: traffic is spiky (uploads peak ~15k/s) so HPA earns its keep, and the ~500M long-lived WebSocket connections rule out request-scoped serverless. Run on **AWS EKS** (EC2 or Fargate) / **GCP GKE**. Serverless still fits the edges — async virus scanning or thumbnailing triggered by an S3/GCS object-created event maps cleanly to **AWS Lambda** / **GCP Cloud Functions (or Cloud Run jobs)** — since those are short, event-driven, and stateless.

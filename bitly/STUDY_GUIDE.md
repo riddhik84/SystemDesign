@@ -41,9 +41,9 @@ Read QPS (peak) ≈ 35,000 RPS   (assume 3× average)
 
 Write ratio 1:1000 → Write QPS ≈ 12 WPS (trivial for any DB)
 
-Storage per URL ≈ 500 bytes (short_code + long_url + metadata)
-1B URLs × 500B = 500 GB  → single PostgreSQL node is fine
-Cache (top 20% of URLs = 80% traffic): 200M × 500B = 100 GB Redis
+Storage per URL ≈ 160 bytes (short_code + long_url + metadata)
+1B URLs × 160B = 160 GB  → single PostgreSQL node is fine
+Cache (top 20% of URLs = 80% traffic): 200M × 160B = 32 GB Redis
 
 Base62 codes: 62^8 = 218 trillion → never exhausted at this scale
 ```
@@ -240,7 +240,7 @@ These are the signals that separate good from great answers:
 
 4. **Mention cache TTL alignment.** Most candidates just say "use Redis." Saying TTLs align to URL expiration shows operational depth.
 
-5. **Know your numbers.** 35K RPS peak reads, 500GB storage, 100GB cache. Derive them out loud.
+5. **Know your numbers.** 35K RPS peak reads, 160GB storage, 32GB cache. Derive them out loud.
 
 6. **Proactively address failure modes.** What happens when Redis is down? When PostgreSQL failover is happening? Availability isn't just uptime — it's graceful degradation.
 
@@ -312,3 +312,51 @@ SCALE:
 ---
 
 *Study this alongside the codebase in `src/` — every decision here maps directly to a class or config.*
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+
+- **Relational DB** — source of truth for the `urls` table; every redirect is a primary-key lookup on `short_code` and the `UNIQUE` constraint is the collision safety net (PostgreSQL primary + read replicas).
+- **Key-value / cache** — Redis serves double duty: cache-aside `url:{code}` lookups for sub-ms redirects, and the atomic `INCRBY url:counter` that feeds `ShortCodeGenerator`'s batch allocation.
+- **CDN / edge** — caches the `302 Location` response for viral / hot links (Zipf top-1000) so a Super Bowl-scale spike is absorbed at the edge instead of by app nodes.
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|----------------|--------------------|-----|-----|----------------------|
+| Relational DB | Local PostgreSQL 15 (Docker); H2 in repo tests | RDS for PostgreSQL or Aurora PostgreSQL (Multi-AZ) | Cloud SQL for PostgreSQL or AlloyDB for PostgreSQL | Durable ACID store with a `UNIQUE` short_code constraint; add read replicas for cache-miss traffic |
+| Key-value / cache (+ atomic counter) | Local Redis 7 via Lettuce (Docker); embedded-redis in tests | ElastiCache for Redis (MemoryDB if you need durability) | Memorystore for Redis (or Memorystore for Redis Cluster) | Sub-ms hot-link reads and atomic `INCRBY` counter batching |
+| CDN / edge | None (localhost) | CloudFront | Cloud CDN (fronted by the Global External Application LB) or Media CDN | Cache `302` responses at the edge for predictable viral spikes |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers for this design:
+- **Peak read QPS ≈ 35,000 RPS** (11.5K avg × 3) — the number every tier is sized against.
+- **Peak write QPS ≈ 35 WPS** — trivial; the write path never drives sizing.
+- **Storage ≈ 160 GB now → ~800 GB at 5-year retention.**
+- **Hot cache set ≈ 32 GB** (20% of URLs = 80% of traffic); at ~99% hit rate that is ~34,650 RPS to Redis and only ~350 RPS falling through to PostgreSQL.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|------|----------------|--------------|-----|-----|
+| App / API tier | 35K RPS peak reads | Redirect is a Redis GET + `302` (~1ms), so a node sustains ~5K RPS: ~35K / ~5K ≈ 7 nodes + ~50% headroom ≈ **10-11 nodes** (matches the design's 10-node bandwidth/pool assumption) | ~10× `c7g.xlarge` (4 vCPU, Graviton3) in an ASG behind an ALB | ~10× `c3-standard-4` (or `e2-standard-4`) in a MIG behind the global LB |
+| Primary DB | 160 GB data (800 GB @ 5yr), 35 WPS | Single write primary, memory-optimized to keep indexes + working set in RAM; synchronous standby for HA | `db.r7g.2xlarge` RDS/Aurora PostgreSQL, Multi-AZ | Cloud SQL `db-highmem-16` (HA) or AlloyDB 16 vCPU |
+| Read replicas | ~350 RPS cache-miss reads | Each replica does ~5K index-scan QPS, so miss traffic is nothing — keep 2 for HA + rolling maintenance, not load | 2× `db.r6g.xlarge` read replicas | 2× Cloud SQL read replicas / AlloyDB read pool |
+| Cache (Redis) | 32 GB hot set, ~34.6K RPS | One node must hold >32 GB with headroom; add a replica for HA, shard to Cluster mode only when the set outgrows 32 GB | ElastiCache for Redis `cache.r7g.2xlarge` (~52 GB), 1 primary + 1-2 replicas | Memorystore for Redis, Standard HA tier ~50 GB |
+| CDN / edge | top-1000 links ≈ 90% of traffic; 100-1000× viral spikes | Managed edge autoscales — no instance count; cache `302` with a short (~30s) TTL | CloudFront | Cloud CDN |
+| Expiry cleanup job | Periodic scan of the `expiration_date` partial index | Tiny scheduled batch; no standing fleet — run it serverless | EventBridge Scheduler → Lambda (or a Fargate task) | Cloud Scheduler → Cloud Run job |
+
+### Load balancing & edge
+
+- **L7 application LB** for the two HTTP routes (`POST /urls`, `GET /{code}`), TLS termination, and health-check ejection via `/actuator/health` — **AWS Application Load Balancer (ALB)** / **GCP Global External Application Load Balancer**.
+- **CDN in front of the LB** for hot links: it caches the `302 Location` at the edge so viral spikes never reach the app tier — **CloudFront** / **Cloud CDN**.
+- **Going global (<100ms worldwide):** anycast in front of regional stacks — **AWS Global Accelerator** (or Route 53 latency routing) / GCP's global LB is already a single anycast IP, so no extra product is needed.
+- **No sticky sessions required:** there is no WebSocket or long-lived-connection tier — app nodes are fully stateless (all state is in Redis/PostgreSQL), so plain round-robin is correct and any node can serve any request.
+
+### VMs vs containers vs serverless — the call
+
+Run the redirect fleet as **containers**: traffic is steady and high-volume (35K RPS sustained, spikes absorbed by the CDN), and the service is a stateless, always-on HTTP app that benefits from fast horizontal autoscaling and rolling deploys — **AWS EKS or ECS Fargate** / **GCP GKE or Cloud Run**. Serverless per-request functions are a poor fit for a 35K-RPS steady redirect path (cold starts and per-invocation cost), and raw VMs give up the bin-packing and deploy ergonomics containers provide; reserve serverless (**Lambda** / **Cloud Run jobs**) only for the tiny scheduled expiry-cleanup task.

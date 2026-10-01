@@ -638,3 +638,54 @@ SCALING:
   DB: shard by user_id (consistent hashing)
   S3: 73PB/year media storage
   Async fanout: 50 threads × 11,600 writes/sec = 580K capacity
+```
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Relational DB** — stores users, posts, follows, and media metadata; the `(author_id, created_at)` index is what powers the celebrity fanout-on-read query.
+- **Key-value / cache** — Redis holds the precomputed feed ZSETs (`insta:feed:{userId}`) and the post-detail cache (`insta:post:{postId}`); it absorbs 80%+ of feed reads.
+- **Object / blob storage** — the actual photo/video bytes (22.5 PB over 30 days) live here, not in the DB; posts store only CDN URLs.
+- **CDN / edge** — serves media reads globally (222 Tbps peak download) and offloads that bandwidth from origin and app servers.
+- **Stream-log / task queue** — decouples post creation from the ~231K Redis writes/sec fanout; in-JVM `@Async` today, a durable queue (Kafka/SQS) in production so fanout survives worker restarts.
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|----------------|--------------------|-----|-----|----------------------|
+| Relational DB | H2 in-memory (PostgreSQL in prod) | Amazon Aurora PostgreSQL (or RDS for PostgreSQL) | AlloyDB for PostgreSQL (or Cloud SQL for PostgreSQL) | Strongly-consistent follow/unfollow + indexed author/time scans; sharded by `user_id`. |
+| Key-value / cache | Embedded/local Redis 7 | Amazon ElastiCache for Redis (MemoryDB if you need durability) | Memorystore for Redis (Cluster mode) | Sub-ms feed ZSET range reads and idempotent ZADD fanout at 100K+ ops/sec/node. |
+| Object / blob storage | Simulated local URLs | Amazon S3 | Google Cloud Storage | Cheap, 11-nines-durable storage for petabytes of immutable media; direct presigned uploads. |
+| CDN / edge | Simulated CDN URLs | Amazon CloudFront | Cloud CDN (Media CDN for video) | Edge-cache media near users; ~95% hit rate keeps origin egress at ~5%. |
+| Stream / task queue | In-JVM `@Async` `fanoutExecutor` | Amazon SQS (or Amazon MSK for Kafka) | Cloud Pub/Sub (or Google-managed Kafka) | Durable, retryable fanout: POST → queue → worker fleet → Redis, decoupled from request latency. |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers (from README capacity + study-guide Numbers):
+- **Feed read QPS: ~173K average, ~300–320K peak** (README's 30 refreshes/day; the study guide's lighter 10-reads/day gives ~58K — size for the peak).
+- **Write QPS: ~1,157 posts/sec, ~1,500/sec incl. follows.**
+- **Fanout: ~231K Redis writes/sec** (README's 100M posts/day × ~200 followers; the study guide's Key Numbers use 500 followers → ~580K writes/sec — size for the higher figure if you take the 500-follower basis).
+- **Storage: 22.5 PB media blobs, ~9 TB DB metadata, ~2.4 TB Redis working set** (README's 30-day / 200-follower basis; the study guide's Key Numbers give 73 PB/yr media and 8 TB / 24 TB-replicated Redis on a 200M-user × 1,000-posts × 40-byte basis — same components, different retention/entry-size assumptions).
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|------|----------------|--------------|-----|-----|
+| App / API tier | ~320K peak feed QPS | ~320K QPS / ~500 RPS per node ≈ 640 nodes + ~50% headroom ≈ ~1000 nodes | c7g.2xlarge (Graviton, stateless, autoscaled) | c3-standard-8 / n2-standard-8 |
+| Primary DB (sharded Postgres) | ~9 TB, ~1.5K write QPS | 9 TB / 64 shards ≈ 150 GB + ~3K QPS per shard; one writer per shard | Aurora PostgreSQL db.r6g.4xlarge writer/shard | AlloyDB primary (~32 vCPU / 256 GB) or Cloud SQL Enterprise Plus per shard |
+| Read replicas | ~38K DB read QPS (~20% cache-miss + cold-start + celebrity; 80%+ absorbed by Redis) | ~38K / 64 shards ≈ 600 read QPS/shard — 2 replicas per shard, sized for failover/HA rather than read load | Aurora read replicas db.r6g.4xlarge | AlloyDB read pool / Cloud SQL read replicas |
+| Cache (feed + post) | 2.4 TB, 231K writes/sec + 173K reads/sec | ~50 shards × ~48 GB; 2 replicas each → ~150 nodes | ElastiCache cache.r7g.2xlarge (~52 GB) | Memorystore for Redis Cluster (~50 GB shards) |
+| Object store | 22.5 PB (30-day) | Serverless — no instances; scales automatically | S3 Standard + Intelligent-Tiering | GCS Standard + Autoclass |
+| CDN / edge | 222 Tbps peak egress, ~95% hit | Edge PoPs — no instance sizing | CloudFront | Cloud CDN / Media CDN |
+| Fanout worker fleet | ~231K Redis writes/sec | 231K / ~25K writes/sec per worker (pipelined ZADD) ≈ ~10 workers + headroom ≈ ~15 | c7g.xlarge queue consumers | c3-highcpu-4 workers |
+
+### Load balancing & edge
+- **L7 application LB** for the JSON API (host/path routing, TLS termination) in front of the stateless app fleet: **AWS Application Load Balancer (ALB)** / **GCP Global External Application Load Balancer**. Plain round-robin — feed reads carry `userId` and hold no server session, so no stickiness needed.
+- **Global anycast + CDN** for media reads: **CloudFront** / **Cloud CDN (Media CDN for video)** serve blobs from S3/GCS at the edge, absorbing the 222 Tbps download and ~95% of read bandwidth before it reaches origin.
+- **L4 network LB** is the fallback only if you need a static ingress IP or ultra-low-overhead passthrough: **AWS Network Load Balancer** / **GCP External passthrough Network Load Balancer** — usually unnecessary here since ALB handles the HTTP routing.
+- **No WebSocket / long-lived tier:** the feed is request/response HTTP polling, so there are no sticky-session or connection-draining concerns — a stateless L7 LB round-robins cleanly.
+
+### VMs vs containers vs serverless — the call
+Go with **containers on managed Kubernetes** — **Amazon EKS** / **Google GKE** (ECS or Cloud Run for lighter ops). Traffic is steady and high-volume with predictable diurnal peaks (300K+ QPS), and the fanout worker fleet is a long-running queue consumer — both favor bin-packed, fast-autoscaling (HPA on CPU/RPS) containers over per-request serverless, which gets expensive at sustained QPS and is awkward for long-lived consumers, and over hand-managed VMs, which scale and roll out too slowly. Keep the DB, cache, object store, CDN, and queue as managed services. Serverless (**AWS Lambda** / **GCP Cloud Functions or Cloud Run jobs**) fits only the spiky, event-driven edges — e.g. the post-upload thumbnail/transcode trigger (S3 event → Lambda / GCS event → Cloud Run job).

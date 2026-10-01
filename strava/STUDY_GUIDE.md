@@ -96,3 +96,43 @@ A: Deliberately eventually-consistent. The client is authoritative for the live 
   - Read: `GET /api/activities/{id}`, `.../route`, `.../live`, `GET /api/users/{userId}/activities`
   - Feed: `GET /api/users/{userId}/feed`, `.../feed/live`
   - Segments: `GET /api/segments`, `GET /api/segments/{segmentId}/leaderboard`
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Relational DB** — the system of record for `activities` (running aggregates + `lastSequence` guard), `route_points` (append-only, unique `(activity_id, sequence)`), `users`, `friendships`, `segments`, `segment_efforts`; every table shards cleanly by `activity_id`/`user_id`.
+- **Key-value / cache** — Redis backs the Beacon live-location entries (`strava:live:{activityId}`, String + 300s TTL) and the segment leaderboards (`strava:leaderboard:{segmentId}`, sorted set, best-time-only), both rebuildable from the DB.
+- **Task queue / async worker** — segment matching runs off the request thread after the completing transaction commits (`@Async @TransactionalEventListener(AFTER_COMMIT)` today), so `stop` returns immediately and matching only ever reads committed data.
+
+### Managed-service equivalents
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|----------------|--------------------|-----|-----|----------------------|
+| Relational DB | H2 in-memory | RDS / Aurora PostgreSQL (sharded); route points aged to S3 + Athena | Cloud SQL for PostgreSQL / AlloyDB (sharded); route points aged to GCS + BigQuery | System of record; shard hot/recent by `activity_id`, age immutable route points to a columnar cold store |
+| Key-value / cache | Local Redis (optional) | ElastiCache for Redis (cluster mode) | Memorystore for Redis Cluster | Short-TTL live-location reads + O(log N) leaderboard sorted sets; a miss degrades to the DB |
+| Task queue / async worker | In-JVM Spring `@Async` `ThreadPoolTaskExecutor` (`CallerRunsPolicy`) | SQS + worker fleet (or EventBridge event bus) | Pub/Sub + worker fleet (or Eventarc event bus) | Decouple post-completion segment matching from the ingest/stop path; absorb morning/evening completion bursts |
+
+### Compute & capacity sizing (from our BOTE numbers)
+Driving numbers for this design (from the Key Numbers section + README capacity):
+- **10M concurrent activities** at peak.
+- **~1M append-writes/sec** — each client flushes a batch every ~10s (10M ÷ 10s). At 1 Hz sampling each batch carries ~10 points, so the DB absorbs ~10M route-row inserts/sec (derived).
+- **~0.5 TB/year** of encoded route data (~5 KB × ~100M activities/year); live-location TTL ~300s.
+- **~2,800 activity completions/sec** (derived: 10M concurrent ÷ ~3,600s average activity duration) — the driver for the async segment-matching fleet.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|------|----------------|--------------|-----|-----|
+| App / API tier | ~1M ingest req/sec (one batch/activity/~10s) | ~1M req/sec ÷ ~5K req/sec per node ≈ 200 nodes + ~50% headroom ≈ **~300** | c7g.2xlarge (c7gn if NIC-bound) | c3-standard-8 / n2-standard-8 |
+| Primary DB (sharded) | ~1M batch-writes/sec (~10M route inserts/sec) | ~1M writes/sec ÷ ~15K write-txns/sec per shard primary ≈ ~67 + headroom ≈ **~100 shard primaries**; partition `route_points` by `activity_id`, age to cold store | db.r7g.2xlarge (Aurora/RDS PostgreSQL) | Cloud SQL (high-mem) / AlloyDB |
+| Read replicas | Feeds/detail reads (cache-served, dwarfed by writes) | 1–2 replicas per shard for read scale + HA ≈ **~100–200 replicas** | db.r7g.2xlarge read replicas | Cloud SQL / AlloyDB read pool |
+| Cache (Redis) | ~1M live writes/sec + live/feed reads; 10M live entries | ~1M+ ops/sec ÷ ~100K ops/sec per node ≈ ~10 + headroom ≈ **~15 nodes** (cluster mode); working set 10M × ~300 B ≈ ~3 GB + leaderboard ZSETs | cache.r7g.large (ElastiCache cluster) | Memorystore for Redis Cluster (Standard) |
+| Async worker fleet (segment matching) | ~2,800 completions/sec, each replaying ~3,600 points | ~2,800 ÷ ~100 jobs/sec per node ≈ ~28 + headroom ≈ **~40 nodes**; bursty → autoscale | c7g.xlarge (or Lambda/Fargate) | c3-highcpu-8 (or Cloud Run jobs) |
+
+### Load balancing & edge
+- **L7 application LB** fronts the REST API (batch ingest + reads) for TLS termination and path/host routing: **AWS ALB** ↔ **GCP Global External Application Load Balancer**.
+- **Global anycast** for a worldwide athlete base so mobile clients hit the nearest region: **AWS Global Accelerator** ↔ GCP's global LB is anycast by default. Use an **L4 NLB** (**AWS NLB** ↔ **GCP External passthrough Network LB**) only if you need raw pass-through throughput.
+- **CDN** fronts the immutable read path — a completed activity's route never changes, so cache `GET .../route` and activity detail at the edge: **AWS CloudFront** ↔ **GCP Cloud CDN**.
+- **Long-lived connections:** today Beacon is cache + polled read, so **no sticky sessions are needed** — any node serves any request. The production WebSocket/SSE push upgrade would need WebSocket-capable L7 LBs (ALB and GCP's LB both support it); keep connections stateless by externalizing live position to Redis so no client affinity is required.
+
+### VMs vs containers vs serverless — the call
+Run the app/API and data tiers as **containers on managed Kubernetes — AWS EKS ↔ GCP GKE** (ECS/Cloud Run are fine substitutes): the ingest path is steady, high-volume (~1M req/sec) and horizontally sharded, where always-on containers beat per-invocation serverless on cost and dodge JVM cold-start latency, while giving cleaner rollouts and autoscaling than raw EC2/Compute Engine VMs. The one tier that is genuinely spiky — the **segment-matching worker**, which fires in morning/evening completion bursts — is the best serverless candidate: run it as **AWS Lambda (SQS-triggered) ↔ GCP Cloud Run jobs (Pub/Sub-triggered)** so it scales to zero between peaks.

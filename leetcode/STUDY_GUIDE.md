@@ -381,3 +381,52 @@ GET /api/leaderboard/{competitionId}?page=1&limit=100
 5. **Week 5**: Full end-to-end interview simulation
 
 **Good luck! Remember: clarity > completeness, communication > correctness**
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Relational DB** — problems, test cases, submissions, and competitions are structured and relational (`submissions` FK to `problems`, competition membership); this is the durable system of record.
+- **Key-value / cache** — Redis holds the real-time leaderboard as a Sorted Set (ZSET) per competition and caches problem metadata (10-min TTL) to keep leaderboard/browse reads off the DB.
+- **Task queue** — a submission queue (SQS in the design; in-JVM `ThreadPoolTaskExecutor` in the repo) decouples the `POST /submit` (202 Accepted) from the 5-second code-execution work and gives natural retry.
+- **Code-execution sandbox fleet** — the defining compute primitive: an isolated, resource-capped Docker/microVM tier that runs untrusted user code (read-only FS, no network, 256MB / 50% CPU, 5s hard timeout, seccomp).
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|---|---|---|---|---|
+| Relational DB | H2 in-memory (JPA/Hibernate) | Amazon RDS or Aurora PostgreSQL | Cloud SQL for PostgreSQL, or AlloyDB for higher read throughput | Structured, relational data (problems, submissions, competitions) needing ACID and joins |
+| Key-value / cache (leaderboard + metadata) | Local Redis via Spring Data Redis | ElastiCache for Redis (cluster mode) | Memorystore for Redis (Cluster) | O(log N) ZSET ranking and hot-read caching; shard by `competitionId` |
+| Task queue | In-JVM `ThreadPoolTaskExecutor` (SQS in the design) | Amazon SQS | Cloud Tasks (pull/dispatch semantics) or Pub/Sub | Buffer submission spikes, absorb 10K concurrent submits, retry via DLQ |
+| Code-execution sandbox fleet | Local Docker Engine via Docker Java API | ECS/EC2 fleet with gVisor or Firecracker microVMs (Lambda only if cold start is tolerable) | GKE Sandbox (gVisor is first-party) or Cloud Run gen2 (gVisor) on a dedicated pool | Strong kernel isolation for untrusted multi-tenant code with hard CPU/mem/time caps |
+
+Note: plain AWS Fargate / GCP Cloud Run without gVisor is not recommended for untrusted multi-tenant code — use a gVisor/Firecracker-isolated pool.
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers for this design:
+- **100,000 concurrent users** during competitions; **10,000 concurrent submissions** in flight.
+- **~1,667 CPU cores** to clear code execution within 1 minute (10K submissions × 100 tests × 100ms ÷ 60s).
+- **1M submissions/day** (~12 writes/sec avg, peaking to hundreds/sec at contest end) and **~11 GB/day** storage growth.
+- **Peak API QPS ≈ 40K** (derived, not stated): leaderboard polls 100K users ÷ 5s ≈ 20K + submission-status polls 10K in-flight ÷ 1s ≈ 10K + problem browsing ~10K.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|---|---|---|---|---|
+| App / API tier | ~40K peak QPS | ~40K QPS ÷ ~5K QPS per node ~= 8 nodes + ~50% headroom ~= 12 | c7g.2xlarge (8 vCPU) x12, ALB-fronted, autoscaled | c3-standard-8 x12 |
+| Primary relational DB | ~12 writes/s avg, peaks to ~500/s; +11 GB/day | Single writer handles the write rate; scale storage, not writers | Aurora PostgreSQL db.r6g.2xlarge (writer) | Cloud SQL PG / AlloyDB, ~8 vCPU / 64 GB primary |
+| Read replicas | Catalog + history reads (mostly cached) | 2 replicas for read scale + HA failover | 2x Aurora db.r6g.xlarge replicas | 2x AlloyDB read pool / Cloud SQL read replicas |
+| Cache (Redis leaderboard) | ~20-30K QPS; ~5 MB/competition + 500 MB metadata | Ops-bound, not memory-bound; 3 shards, shard by `competitionId` | ElastiCache cache.r7g.large x3 (cluster mode) | Memorystore for Redis Cluster, ~3x standard nodes |
+| Task queue | 10K concurrent submissions | Fully managed, scales automatically; no node sizing | Amazon SQS (+ DLQ) | Cloud Tasks or Pub/Sub (+ dead-letter) |
+| Code-execution sandbox fleet | ~1,667 vCPU | ~1,667 vCPU ÷ 64 vCPU/node ~= 26 nodes + ~35% headroom ~= 35, autoscaled down between contests | c7i.16xlarge (64 vCPU) x~35, gVisor/Firecracker | c3-standard-88 x~26 (88 vCPU each, ~2,288 vCPU with matching ~35% headroom), GKE Sandbox pool |
+
+x86 (c7i / c3) is preferred for the sandbox tier for broadest language-runtime compatibility; use c7g/c4a (Graviton/Arm) only if every runtime is Arm-clean.
+
+### Load balancing & edge
+- **L7 application load balancer** for the stateless REST API — AWS Application Load Balancer ↔ GCP External Application Load Balancer — for path routing (`/api/problems`, `/api/submissions`, `/api/leaderboard`) and TLS termination.
+- **No sticky sessions needed**: the design deliberately uses HTTP polling (not WebSockets) for submission status and leaderboard, so every node is stateless and any node serves any request — round-robin is fine.
+- **CDN fronts static problem content** — AWS CloudFront ↔ GCP Cloud CDN — for problem statements, code stubs, and assets served globally; the API and leaderboard stay dynamic behind the LB.
+- For multi-region, add global DNS/anycast — AWS Route 53 (latency routing) ↔ GCP Cloud DNS + global Application LB.
+
+### VMs vs containers vs serverless — the call
+Use **containers on Kubernetes** — AWS EKS ↔ GCP GKE (ECS/Cloud Run are fine for the API alone). Traffic is highly spiky (contests are scheduled windows), the API and workers are stateless, and autoscaling on CPU + queue depth maps cleanly to pods. The execution fleet must run on a **dedicated node pool with kernel-level isolation** (Firecracker/gVisor on EKS, or GKE Sandbox which ships gVisor first-party). Avoid raw VMs (too slow to scale for burst contest load) and avoid serverless on the execution hot path — Lambda/Cloud Functions cold starts directly threaten the 5-second result SLA the design commits to.

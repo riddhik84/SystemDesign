@@ -420,3 +420,54 @@ SCALE:
 - PostgreSQL sharded by geography
 - Redis cluster for cache
 ```
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Relational DB** — source of truth for `businesses`, `reviews`, `users`, and the `geo_index` table; holds the denormalized `starRating`/`reviewCount` and enforces the `UNIQUE(businessId, userId)` constraint.
+- **Key-value / cache** — Redis holds search results (`yelp:search:*`, 5-min TTL) and hot business detail (`yelp:biz:*`, 10-min TTL); absorbs ~80% of read traffic.
+- **Full-text / geospatial search** — Elasticsearch serves the production `geo_distance` + multi-field text query over 500M business docs, replacing the SQL bounding-box scan.
+- **Object / blob storage** — stores the 150TB of business photos; clients upload directly via presigned URLs, bypassing app servers.
+- **CDN / edge** — serves photos and cached API responses for top cities at the edge, cutting origin load and detail latency.
+- **Stream-log / pub-sub** — Kafka carries review events for async rating aggregation (needed once a business exceeds ~1K reviews/sec) and feeds the Elasticsearch indexer.
+- **Change-data-capture** — Debezium tails the PostgreSQL WAL → Kafka → ES indexer to keep the search index eventually consistent with the primary DB.
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|----------------|--------------------|-----|-----|----------------------|
+| Relational DB | H2 in-memory (PostgreSQL in prod) | RDS / Aurora PostgreSQL | Cloud SQL for PostgreSQL or AlloyDB | Transactional writes, joins, unique constraints, denormalized aggregates |
+| Key-value / cache | Local/embedded Redis (degrades gracefully if absent) | ElastiCache for Redis | Memorystore for Redis | Absorb read QPS, cache search results + business detail |
+| Full-text / geospatial search | In-JVM bounding-box + Haversine | OpenSearch Service | No managed Elasticsearch — Elastic Cloud on GCP, or self-manage OpenSearch on GCE/GKE | Geo + full-text query at 500M docs without table scans |
+| Object / blob storage | Local disk / referenced URLs | S3 | Cloud Storage | Store 150TB of photos cheaply, presigned direct upload |
+| CDN / edge | None (served by app) | CloudFront | Cloud CDN (via global external ALB) | Cache photos + hot-city API responses at edge |
+| Stream-log / pub-sub | In-JVM synchronous recalc | MSK (managed Kafka) | Managed Service for Apache Kafka, or Pub/Sub | Async rating aggregation, decoupled ES indexing |
+| Change-data-capture | None (synchronous JPA writes) | MSK Connect + Debezium | Datastream (managed PG CDC), or self-managed Debezium on GKE | Keep Elasticsearch in sync with PostgreSQL WAL |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers: **~11,600 search QPS + ~5,800 detail QPS ≈ 17.4K read QPS total**; **~80% cache hit** leaves **~2,320 QPS → Elasticsearch** and **~2,300 effective DB QPS**; **~110 writes/sec** (100 reviews + 10 business); storage is **500GB businesses + 20GB reviews** relational, **~1TB Elasticsearch index** (500GB × 2 replicas), **150TB photos** in object store.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|------|----------------|--------------|-----|-----|
+| App / API tier (search + write, stateless) | ~17.4K QPS total | ~17.4K QPS / ~2K QPS per node ~= 9 nodes + ~50% headroom ~= 15 | ~15 × c7g.2xlarge behind ALB | ~15 × c3-standard-8 (MIG) |
+| Primary DB (PostgreSQL, sharded by geo) | ~110 writes/sec, 520GB | Write rate is trivial; size for RAM to hold working set + storage; 4 geo shards | Aurora PostgreSQL db.r6g.2xlarge × 4 shards | AlloyDB / Cloud SQL 16 vCPU / 128GB × 4 shards |
+| Read replicas | ~5,800 detail QPS + uncached review pages | Fan detail reads to replicas; 2 replicas per shard | 2 × db.r6g.xlarge per shard | Cloud SQL read replicas / AlloyDB read pool × 2 per shard |
+| Cache (Redis) | ~9,280 QPS, ~50-100GB working set | Throughput trivial for Redis; size for hot working set; cluster-mode + replica for HA | ElastiCache cache.r7g.2xlarge × 3 (cluster mode) | Memorystore for Redis Standard, ~100GB tier |
+| Object store (photos) | 150TB, grows with businesses | Managed, no instances; lifecycle to IA/coldline | S3 Standard (+ IA tiering) | Cloud Storage Standard (+ Nearline) |
+| Search (Elasticsearch) | ~2,320 QPS, ~1TB index | 500GB × 2 replicas / ~250GB per node ~= 4 data nodes + headroom ~= 5 | OpenSearch r6g.2xlarge.search × 5 data nodes | No managed ES — Elastic Cloud on GCP, or n2-highmem-8 × 5 on GKE |
+| Streaming (Kafka) | ~110 events/sec + WAL stream | Volume tiny; size 3 brokers for HA, not throughput | MSK kafka.m7g.large × 3 | Managed Kafka m-tier × 3, or Pub/Sub |
+| Async indexer / aggregation workers | ~110 events/sec consumed | Consume Kafka/CDC → reindex ES + batch-update ratings; 2-3 for HA | 2-3 × m7g.large | 2-3 × n2-standard-4 |
+
+### Load balancing & edge
+- **L7 application load balancer** fronts the stateless API for host/path routing (search vs write vs review endpoints) and TLS termination — AWS **Application Load Balancer (ALB)**, GCP **Global external Application Load Balancer**.
+- **CDN in front of the LB** caches photos and hot-city search/detail responses at the edge — AWS **CloudFront**, GCP **Cloud CDN**. Photo upload uses presigned URLs straight to object storage, skipping the LB entirely.
+- **No sticky sessions needed** — every request is short-lived request/response and services are stateless, so plain round-robin / least-outstanding-requests is correct; there is no WebSocket or long-lived-connection tier to pin.
+- A **global anycast** front end matters only for multi-region: route users to the nearest regional shard/cluster to keep search under p99 100ms — AWS **Global Accelerator + Route 53 latency routing**, GCP's global ALB is anycast by default.
+
+### VMs vs containers vs serverless — the call
+Run the app and worker tiers as **containers on managed Kubernetes** — AWS **EKS** / GCP **GKE (Autopilot)**. Traffic is steady and high (17.4K QPS sustained) with regional peaks, so you want fast horizontal autoscaling and dense bin-packing across the ~15-node stateless fleet plus the small async worker fleet. Serverless (Lambda / Cloud Functions) is a poor fit: sustained high QPS makes per-invocation pricing expensive and cold starts jeopardize the p99 < 100ms search target. Raw VMs would work but give up the packing and rollout ergonomics containers provide for a fleet this size; reserve managed VMs (EC2 / Compute Engine) only for the stateful Elasticsearch/Kafka nodes where you self-manage.

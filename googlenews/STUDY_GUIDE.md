@@ -375,3 +375,59 @@ Use this checklist to ensure you've covered all key areas in your interview:
 > "The system polls 10K RSS feeds every 5-15 minutes, deduplicates using content hashing, and stores articles in PostgreSQL. Personalized feeds are cached in Redis for 5 minutes. We use two-stage ranking: first retrieve 500 candidates matching user interests, then score them by freshness, trust, and engagement. Elasticsearch handles full-text search with time-based indices."
 
 Good luck with your interview! 🚀
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+
+- **Relational DB** — articles, sources, topics, and user interests are relational (FKs, `@ManyToMany` topics, indexed `(source_id, published_at)` / `content_hash`); PostgreSQL is the primary store.
+- **Key-value / cache** — Redis holds `feed:{userId}`, `article:{id}`, `trending:global`, and `user:interests:{userId}` (plus a Caffeine L1 in-process cache) to hit the < 500 ms p95 feed target at an 80% hit rate.
+- **Full-text search** — Elasticsearch backs `GET /search` with multi-field boosting, fuzziness, and highlighting; PostgreSQL FTS is the fallback.
+- **Stream-log / task queue** — a message queue decouples the crawler from the `ArticleProcessor` (dedupe + parse + index), so ingestion spikes (~50 writes/s during breaking news) don't block the write path.
+- **Object / blob storage** — cold archive of articles past the 90-day retention window (metadata stays in the DB), keeping the active relational footprint at ~200 GB.
+- **CDN / edge** — serves article images/thumbnails and cacheable GETs close to 500M globally distributed users; also the WAF chokepoint.
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|----------------|--------------------|-----|-----|----------------------|
+| Relational DB | H2 in-memory (tests); PostgreSQL driver wired for prod | RDS for PostgreSQL, or Aurora PostgreSQL | Cloud SQL for PostgreSQL, or AlloyDB | Structured, relational entities with joins and secondary indexes; read-replica fan-out |
+| Key-value / cache | `embedded-redis` (tests) + in-JVM Caffeine | ElastiCache for Redis | Memorystore for Redis | Sub-ms hot reads of feeds/trending/articles; 1000:1 read:write ratio |
+| Full-text search | `spring-data-elasticsearch` against local ES | OpenSearch Service | No first-party managed Elasticsearch/OpenSearch — Elastic Cloud on GCP, or self-manage on GCE | Relevance ranking, fuzzy match, highlighting over millions of docs |
+| Task queue | In-JVM async / direct call (RabbitMQ in the design) | Amazon MQ (RabbitMQ), or SQS | Pub/Sub, or Cloud Tasks | Decouple bursty crawl/ingest from processing; retry + backpressure |
+| Object / blob storage | Local disk (none wired in dev) | S3 (Standard-IA → Glacier) | Cloud Storage (Nearline → Coldline) | Cheap cold archive of expired articles |
+| CDN / edge | N/A locally | CloudFront + AWS WAF | Cloud CDN + Cloud Armor | Cache images/static and shed L7 attacks near users |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers for this design (from README/DESIGN capacity + this guide):
+- **Peak feed read QPS ≈ 30,000** (2.5B feed requests/day, 2× peak factor).
+- **Search QPS ≈ 580** (50M searches/day); **write/ingest ≈ 50/s peak** (1.2/s average, 100K articles/day).
+- **Cache hit rate 80%** → only ~6,000 QPS reaches the DB tier on miss.
+- **Storage ≈ 200 GB active** (90-day retention) → ~600 GB with 3× replication, plus ~500 GB user interests.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|------|----------------|--------------|-----|-----|
+| App / API | ~30K peak QPS | ~30K QPS / ~3K QPS per node (cache-backed JSON) ~= 10 nodes + ~50% headroom ~= 15; matches HPA 5→50 | ~15× c7g.xlarge (Graviton) | ~15× c3-standard-4 |
+| Primary DB | ~50 writes/s + ~600 GB | Writes are trivial; size for working set + candidate-retrieval reads | db.r6g.2xlarge (RDS/Aurora PostgreSQL) | Cloud SQL PostgreSQL 16 vCPU/64 GB, or AlloyDB primary |
+| Read replicas | ~6K read QPS on cache miss | ~6K QPS / 3 ~= 2K QPS each; feed + search + analytics split | 3× db.r6g.2xlarge read replicas | AlloyDB read pool (3), or Cloud SQL read replicas |
+| Cache (Redis) | 24K QPS from cache; 4 GB `maxmemory`, LRU | Throughput trivial for Redis; size for hot working set + HA | ElastiCache cache.r7g.large, 3 shards + 3 replicas | Memorystore for Redis Cluster (~13 GB), or Standard HA |
+| Search (Elasticsearch) | ~580 search QPS; ~200 GB index | 5 shards / 2 replicas per monthly index; 3 hot data nodes | 3× r6g.xlarge.search (OpenSearch); i4i if disk-bound | Elastic Cloud on GCP, or self-managed 3× n2-highmem-4 on GCE |
+| Task queue | ~50 msgs/s peak | Tiny; managed broker or serverless queue | Amazon MQ mq.m5.large ×2, or SQS (serverless) | Pub/Sub (serverless), or Cloud Tasks |
+| Object store (archive) | ~730 GB/year expired articles | Lifecycle to cold tier after 90 days | S3 Standard-IA → Glacier | Cloud Storage Nearline → Coldline |
+| Async crawler/worker fleet | 10K sources / ~10 min ~= ~17 fetches/s + 1.2 articles/s | I/O-bound RSS polling + dedupe/index; small fleet | 2–3× c7g.large | 2–3× n2-standard-2 |
+
+### Load balancing & edge
+
+- **L7 application LB** for path-based HTTP routing (`/feed`, `/search`, `/articles`), TLS termination, and health checks: **AWS ALB** / **GCP Global External Application Load Balancer**.
+- **CDN fronts the LB** for article images and cacheable GETs, and hosts the WAF: **AWS CloudFront + AWS WAF** / **GCP Cloud CDN + Cloud Armor**.
+- **No WebSocket / long-lived tier** — feed and search are stateless request/response, so **no sticky sessions** are needed; least-connections/round-robin across any pod is fine (the API is explicitly stateless and autoscaled).
+- For multi-region low latency, use global anycast: **AWS Global Accelerator** / GCP's global LB is anycast by default.
+
+### VMs vs containers vs serverless — the call
+
+**Containers on Kubernetes (AWS EKS / GCP GKE).** The traffic is read-heavy and spiky (2× peak) behind a stateless API the design already autoscales with an HPA (5→50 pods), so containers give fast scale-out and tight bin-packing. Just as important, the crawler, `ArticleProcessor`, and trending job are long-running scheduled workers holding persistent PostgreSQL/Redis/Elasticsearch connection pools — a natural fit for Deployments/CronJobs but a poor fit for serverless, where cold starts and execution-time limits (Lambda 15 min) hurt pooled connections and long crawl runs. If you wanted the stateless API alone to be serverless you could host it on **AWS App Runner** / **GCP Cloud Run**, but keep the worker fleet on EKS/GKE.

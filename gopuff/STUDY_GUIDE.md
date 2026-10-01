@@ -156,3 +156,44 @@ and inventory live in the same database."*
   on order, degrade gracefully if Redis down.
 - **Geo:** Haversine in-memory scan over ~10K DCs (sub-ms); PostGIS/geohash if larger.
 - **Scale:** read replicas for availability, primary for orders, partition by `region_code`.
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+- **Relational DB (primary + read replicas)** — orders and `inventory` live in one Postgres DB so a single local SERIALIZABLE + `FOR UPDATE` transaction gives atomic reserve-and-order; replicas serve the read-heavy availability path.
+- **Key-value / cache** — Redis fronts `GET /availability` (`avail:{lat2dp}:{lon2dp}:{items}:{page}`, 60s TTL) to absorb the 175:1 read:write skew and hold the p99 < 100 ms SLA.
+
+(No object store, search cluster, stream/queue, or WebSocket tier: geo lookup is an in-JVM Haversine scan over ~10K DCs, cache eviction runs inline, and driver-tracking/streaming are explicit non-goals.)
+
+### Managed-service equivalents
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|---|---|---|---|---|
+| Relational DB (primary) | H2 in tests / local Postgres | RDS for PostgreSQL or Aurora PostgreSQL | Cloud SQL for PostgreSQL or AlloyDB for PostgreSQL | Need ACID + SERIALIZABLE + `SELECT ... FOR UPDATE` so two buyers never claim the same unit |
+| Relational DB (read replicas) | same H2/Postgres | RDS/Aurora read replicas | Cloud SQL read replicas / AlloyDB read pool | Offload the ~175× availability reads from the write primary |
+| Key-value / cache | embedded/local Redis (spring-data-redis) | ElastiCache for Redis (cluster mode) | Memorystore for Redis | Serve most of 20K availability QPS at sub-ms, bound staleness with 60s TTL |
+
+### Compute & capacity sizing (from our BOTE numbers)
+Driving numbers (from §2 and DESIGN.md §2):
+- **~20K availability QPS** peak (reads); **~115 orders/sec** average, **~1K/sec** peak (writes); **read:write ≈ 175:1**.
+- **Cache miss → DB reads ≈ 2K QPS** (derived: assume ~90% Redis hit rate on the 20K read QPS).
+- **Storage:** inventory ≈ 60 GB (up to 1B sparse rows); orders ≈ 1 TB/year (partition by `region_code` + archive).
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|---|---|---|---|---|
+| App / API (stateless Spring Boot) | ~21K peak QPS (20K reads + ~1K writes) | ~21K QPS / ~3K QPS per node ≈ 7 nodes + ~50% headroom ≈ **10–12** across 3 AZs | `c7g.2xlarge` (Graviton, compute) ×12 | `c3-standard-8` ×12 |
+| Postgres primary (writes) | ~1K write TPS peak; 60 GB + orders growth | One memory-optimized primary (SERIALIZABLE order txns fit easily); scale vertically, then shard by `region_code` | `db.r7g.2xlarge` RDS/Aurora PostgreSQL (bump to `.4xlarge` under contention) | Cloud SQL / AlloyDB `n2-highmem-8` |
+| Read replicas (availability) | ~2K read QPS on cache miss | ~2K / ~5K QPS per replica < 1, but run **2–3** for HA + headroom across AZs | 2–3× `db.r7g.2xlarge` read replicas | 2–3× Cloud SQL replicas / AlloyDB read pool (`n2-highmem-8`) |
+| Cache (Redis) | ~18K QPS (≈90% of reads); low-GB working set | One shard easily handles 18K GET/s; size for memory + HA (primary+replica), enable cluster mode to grow | ElastiCache `cache.r7g.large` (primary + replica) | Memorystore for Redis, Standard tier ~5–13 GB |
+
+### Load balancing & edge
+- **L7 application LB** in front of the stateless app tier — terminates TLS, load-balances HTTP/JSON, can path-split `GET /availability` from `POST /orders`: **AWS ALB**, **GCP external Application Load Balancer**.
+- **Geo/latency routing across regional shards** — because inventory/orders shard by `region_code`, route users to their region's stack: **AWS Route 53** latency/geo records → regional ALBs; **GCP Cloud DNS + global external ALB** with regional backends.
+- **No CDN** on the API path — both endpoints return dynamic, location-keyed JSON with nothing cacheable at the edge; Redis is the caching layer. (CloudFront / Cloud CDN would only matter if a static web/mobile-asset front-end were added.)
+- **No sticky sessions needed** — the app tier is stateless and there is no WebSocket/long-lived-connection tier in scope. (Add sticky/affinity-aware routing only if the real-time-tracking extension introduces WebSockets.)
+
+### VMs vs containers vs serverless — the call
+Run the stateless app tier in **containers on managed Kubernetes — AWS EKS (or ECS Fargate) / GCP GKE Autopilot**. Traffic is steady and high-volume rather than bursty-to-zero, and each node keeps warm JVM state plus pooled connections to Postgres and Redis, so serverless (Lambda / Cloud Functions) is a poor fit: cold starts hurt the p99 < 100 ms SLA and per-invocation DB connections would exhaust the primary's pool during the pessimistic-locking order path. Containers give fast HPA autoscaling and rolling deploys without the ops burden of raw VMs, while the databases and cache stay on their managed services above.

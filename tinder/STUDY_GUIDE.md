@@ -491,3 +491,56 @@ GET /api/matches/{userId}
 - [Redis Lua Scripting](https://redis.io/docs/manual/programmability/eval-intro/)
 - [Bloom Filters Explained](https://en.wikipedia.org/wiki/Bloom_filter)
 - [Cassandra Data Modeling](https://cassandra.apache.org/doc/latest/data_modeling/)
+
+---
+
+## Cloud Infrastructure & Sizing (AWS ↔ GCP)
+
+> How you'd actually deploy this. Every AWS service below is paired with its GCP equivalent, and every instance count is derived from this design's own back-of-the-envelope numbers.
+
+### Building blocks this design needs
+
+- **Relational DB** — PostgreSQL holds `users`, `matches`, and (at current scale) `swipes`; needed for ACID match creation on normalized user pairs and relational profile queries.
+- **Key-value / cache** — Redis runs the atomic match-detection Lua script (the race-condition fix) and backs the feed cache (15-min TTL) and profile cache (1-hr TTL).
+- **Wide-column NoSQL** — Cassandra is the write-optimized swipe store at scale (2B writes/day, partition by `swiper_id`, TTL/archive old rows); relieves PostgreSQL of the write firehose.
+- **Full-text / geospatial search** — Elasticsearch/OpenSearch with a `geo_point` index serves sub-100ms `geo_distance` + age/gender candidate queries for the Feed Service (replacing the Postgres Haversine scan).
+- **Stream-log / pub-sub / task queue** — a queue decouples match events from the Notification Service so push-notification fan-out (APNS/FCM) never blocks the swipe response path.
+
+### Managed-service equivalents
+
+| Building block | In this repo (dev) | AWS | GCP | When to reach for it |
+|---|---|---|---|---|
+| Relational DB | PostgreSQL 14 (Docker) | RDS for PostgreSQL / Aurora PostgreSQL | Cloud SQL for PostgreSQL / AlloyDB | Users + matches needing ACID and relational integrity |
+| Key-value / cache | Local Redis 7 (Docker) | ElastiCache for Redis (MemoryDB if you need durability) | Memorystore for Redis | Atomic match detection (Lua) + feed/profile cache |
+| Wide-column NoSQL | (none — swipes in PostgreSQL) | Keyspaces (managed Cassandra) or DynamoDB | Bigtable (wide-column); no managed Cassandra — DataStax Astra on GCP or self-manage on GCE | 2B swipes/day write-heavy, time-series, TTL-able |
+| Geospatial search | (none — Postgres Haversine query) | OpenSearch Service | No managed Elasticsearch/OpenSearch — Elastic Cloud on GCP or self-manage on GCE; for geo-only, AlloyDB/Cloud SQL PostGIS | Sub-100ms geo_distance + attribute filtering for feed |
+| Pub-sub / task queue | In-JVM `@Async` dispatch | MSK (Kafka) or Kinesis; SNS/SQS for notification fan-out | Pub/Sub (or Managed Service for Kafka) | Decouple match events, async push-notification fan-out |
+
+### Compute & capacity sizing (from our BOTE numbers)
+
+Driving numbers (from §7 Capacity Planning + README):
+- **~23K swipe writes/sec** average (2B swipes/day); assume ~2x diurnal peak → **~46K writes/sec peak**.
+- **~1.2K feed reads/sec** (100M feed requests/day); with 90% cache hit → **~120 reads/sec to DB**.
+- **200 GB/day** swipe storage → **~73 TB/year** (before TTL/archival).
+- **~2 GB** Redis match-detection working set (10M active pairs); **20M matches/day → ~40M push notifications/day (~460/sec avg)**.
+
+| Tier | Driving number | Sizing logic | AWS | GCP |
+|---|---|---|---|---|
+| App / API (stateless) | ~48K QPS peak (46K swipe writes + 1.2K feed reads) | ~48K QPS / ~5K QPS per node ~= 10 nodes + ~50% headroom ~= 15 nodes | c7g.2xlarge x15 | c3-standard-8 x15 |
+| Primary relational DB | 20M users, matches ~230 writes/sec, ~120 reads/sec after cache | Memory-optimized primary sized to the user working set; single writer | db.r6g.2xlarge | AlloyDB / Cloud SQL n2-highmem-8 |
+| Read replicas | ~120 DB reads/sec + match-list reads | 2 replicas for feed/match read fan-out + HA | 2x db.r6g.xlarge | AlloyDB read pool / 2x Cloud SQL replicas |
+| Cache (Redis) | ~2 GB match-detect + ~50-80 GB feed/profile cache | Split pools: small low-latency match pool + sharded feed/profile pool | cache.r7g.large (match) + cache.r7g.xlarge x4 (feed) | Memorystore Redis Cluster (Standard, ~100 GB) |
+| Swipe store (Cassandra) | 46K peak writes/sec, 73 TB/yr x RF3 ~= 220 TB | Storage-bound: 46K x RF3 ~= 140K replica-writes/sec (~10-15 nodes by throughput); 220 TB / 7.5 TB per node ~= ~35 NVMe nodes by storage (~262 TB raw) — cut further with TTL/archival | ~35x i4i.8xlarge (7.5 TB NVMe each) or Keyspaces (serverless) | ~35x z3 (local SSD, 7.5 TB class) or Bigtable cluster |
+| Search (OpenSearch) | 20M user docs, ~120-1.2K geo queries/sec | Small index (few GB), memory for geo filters; 3 data nodes for HA | 3x r6g.xlarge.search | Elastic Cloud on GCP / 3x n2-highmem-4 (GCE) |
+| Notification worker + queue | ~460 push/sec avg, ~1K peak | Small Kafka/queue + thin async worker fleet | MSK m7g.large x3 + 3x c7g.large workers | Pub/Sub + Cloud Run workers |
+
+### Load balancing & edge
+
+- **L7 application LB** fronts the stateless REST API and path-routes to Profile/Feed/Swipe/Match services — AWS **Application Load Balancer**, GCP **Global External Application Load Balancer (HTTPS LB)**.
+- **Global anycast routing** for the multi-region deployment (§8): AWS **Global Accelerator** (or Route 53 latency routing); GCP's global HTTPS LB is anycast by default, so one VIP routes to the nearest region.
+- **No WebSocket / long-lived-connection tier** in the core design — match alerts go out via APNS/FCM push, not persistent sockets, so services stay stateless and **sticky sessions are not needed**. If real-time chat is added later, front it with a WebSocket-aware LB (ALB/NLB or GCP LB) and enable connection draining.
+- **No CDN** for the dynamic, per-user feed; add AWS **CloudFront** / GCP **Cloud CDN** only once profile images ship (they'd sit in S3 / Cloud Storage behind the CDN).
+
+### VMs vs containers vs serverless — the call
+
+Run the stateless services on **containers under Kubernetes** — AWS **EKS** (or ECS Fargate) / GCP **GKE**. The traffic is steady and high-volume (~23K writes/sec sustained), which makes per-request serverless billing expensive and exposes JVM cold-start latency, while raw VMs give up the fast horizontal autoscaling and dense bin-packing of many small services (Feed/Swipe/Match/Profile) that you want here. The one exception is the event-driven notification worker, which fits **Lambda / Cloud Run** well since it scales with the bursty match-event stream and idles cheaply between spikes.
